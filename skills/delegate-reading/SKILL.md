@@ -1,13 +1,13 @@
 ---
 name: delegate-reading
-description: "Keep raw bulk content out of the working context on multi-file tasks. Trigger whenever a task involves scanning a codebase, locating symbols across many files, summarizing directories, surveying repo state, auditing a branch, answering \"where is X\" or \"which files touch Y\", or any \"read a lot, decide a little\" work — even if the user didn't explicitly mention subagents, cost, or efficiency. Applies whether running as the top-level orchestrator (where subagent delegation is the strongest tactic) or as a subagent that can't recurse (where the same principles apply via search-first, narrow reads, and digesting before propagating). Lean toward applying this whenever bulk reading is on the path — context discipline is the single biggest lever for reducing token consumption."
+description: "Keep raw bulk content out of the working context on multi-file tasks. Trigger whenever a task involves scanning a codebase, locating symbols across many files, summarizing directories, surveying repo state, auditing a branch, answering \"where is X\" or \"which files touch Y\", or any \"read a lot, decide a little\" work — even if the user didn't explicitly mention subagents, cost, or efficiency. Applies whether running as the top-level orchestrator (where subagent delegation is the strongest tactic) or as a subagent doing the reading itself (where the same principles apply via search-first, narrow reads, and digesting before propagating). Lean toward applying this whenever bulk reading is on the path — context discipline is the single biggest lever for reducing token consumption."
 ---
 
 # Delegate reading
 
 ## The principle
 
-Every token of raw source pulled directly into the working context stays there for the rest of the session, ages out the prompt cache, and gets reprocessed on every subsequent turn. Bulk reading is grunt work — get the *digest*, not the raw source. The goal isn't "always use subagents." The goal is: **the raw text of large files should never settle into the context that has to keep thinking.**
+Every token of raw source pulled directly into the working context stays there until the session ends or is compacted, and gets reprocessed on every subsequent turn. Bulk reading is grunt work — get the *digest*, not the raw source. The goal isn't "always use subagents." The goal is: **the raw text of large files should never settle into the context that has to keep thinking.**
 
 Subagent delegation is the strongest version of this pattern (the bulk text lands in a context that gets discarded), but the same principle applies even when subagents aren't available. What changes is the tactic, not the discipline.
 
@@ -19,7 +19,7 @@ Apply the cheapest tactic that does the job. Escalate only when the cheaper one 
 
 Grep is dramatically cheaper than Read. Often the grep output *is* the answer — file paths, line numbers, hit counts, a one-line context per match. There's no need to open the file at all.
 
-Run `grep -rn <pattern> <scope>` (or equivalent) first. Inspect the matches. Only Read a file when the grep output isn't enough to act on.
+Run `grep -rn <pattern> <scope>` first (or `rg`, or the dedicated Grep tool where the harness provides one). Inspect the matches. Only Read a file when the grep output isn't enough to act on.
 
 Anti-pattern: reading 5 files to find which one mentions a symbol that a single grep would have located instantly.
 
@@ -29,11 +29,11 @@ When a Read is unavoidable, scope it. The `Read` tool supports `offset` and `lim
 
 Anti-pattern: Reading entire files "to get context" when the relevant region is 30 lines. The other 1970 lines now live in context, never to be useful, costing tokens on every turn.
 
-### 3. Delegate to a subagent (orchestrator only)
+### 3. Delegate to a subagent
 
 When the task genuinely requires reading many files end-to-end — multi-file surveys, "summarize this module's responsibilities", cross-cutting audits — spawn a subagent with a cheaper model to do the reading. The subagent's context absorbs the raw text and is discarded when it returns. Only its summary (a few hundred tokens) lands in the orchestrator.
 
-This tactic is only available at the orchestrator level. Subagents can't spawn further subagents — if running inside one, fall back to tactics 1 and 2 with extra discipline.
+This tactic belongs mainly to the top-level session. Current Claude Code does let a subagent spawn its own subagents a few levels deep (the depth is configurable, and some agent types have no Agent tool at all), but if you *are* a subagent you were most likely spawned to be the throwaway reading context. Do the reading yourself with tactics 1 and 2, and delegate further only when your sub-task is itself a large, independent survey.
 
 See [Subagent delegation](#subagent-delegation) below for how to do this well.
 
@@ -65,20 +65,24 @@ When the orchestrator decides bulk reading is unavoidable, route it through a su
 
 | Type | Best for |
 |---|---|
-| `Explore` | Read-only search — "where is X", "find files matching Y", "which callers of Z exist". The default for pure retrieval. Can't write files. |
-| `general-purpose` | Multi-step research, or work that needs to read + reason + write its output to disk. Slower and pricier than Explore. |
+| `Explore` | Read-only locating — "where is X", "find files matching Y", "which callers of Z exist". The default for pure retrieval. In current builds it tends to work from excerpts rather than whole files, so treat it as a finder, not a reviewer. Can't write files. |
+| `general-purpose` | Anything that needs files read in full and reasoned about — "summarize this module's responsibilities", audits, "what's left to ship" — or that must write its output to disk. Slower and pricier than Explore. |
+
+A survey splits along the same line: "what's in this repo and where does each thing live" is structure, so `Explore` handles it; "what's left to ship" or "anything weird about this branch" needs files read and judged, so it goes to `general-purpose`.
+
+The agent types on offer vary by harness version and by what the user has defined in `.claude/agents/`; check the list your Agent tool actually shows. If it offers a *fork* (a copy of yourself), note that a fork inherits your entire context and your model — its reading still stays out of your context, but it is the expensive way to get a digest, so prefer a fresh agent for bulk reading.
 
 ### Picking model
 
 Match to the judgment the work actually requires.
 
-| Model | When |
+| Tier | When |
 |---|---|
-| `haiku` | Pure retrieval, grep-style lookups, mechanical summarization, listing matches. |
-| `sonnet` | Bulk reading + light reasoning ("explain this module's responsibilities", "summarize what this PR changes"). |
-| `opus` | Rare for read-only work. If the work needs Opus-level reasoning, the orchestrator should usually do it directly so the conclusion can immediately shape next steps. |
+| Smallest (`haiku`) | Pure retrieval, grep-style lookups, mechanical summarization, listing matches. |
+| Mid (`sonnet`) | Bulk reading + light reasoning ("explain this module's responsibilities", "summarize what this PR changes"). |
+| Top (`opus` or above) | Rare for read-only work. If the reading needs top-tier reasoning, the orchestrator should usually do it directly so the conclusion can immediately shape next steps. |
 
-Inheriting the orchestrator's model is the wrong default for retrieval. Override it explicitly.
+The built-in agent types generally run on the session's model unless told otherwise, which is the wrong default for retrieval — pass the Agent tool's `model` parameter explicitly. It takes the aliases your harness lists (`haiku`, `sonnet`, …), not full model IDs. The trade-off is real, though: a digest is only as good as its reader, so when a missed detail would send the next decision the wrong way, step up a tier rather than saving on the read and paying for a wrong turn.
 
 ### Briefing pattern
 
@@ -92,11 +96,13 @@ Discipline: <baked-in tactics, see below>
 Report back: <the specific format and length wanted>
 ```
 
+State the goal and what has already been ruled out, but not the answer you expect. A subagent handed a hypothesis tends to return it confirmed, and its mistakes come back in the same confident tone as its findings.
+
 Always cap response length explicitly: "report in under 200 words", "list paths only, no prose", "≤30 entries — if more, group by directory." Without a cap, subagents return verbose write-ups that defeat the savings — the orchestrator now has the long write-up *and* still has to read it.
 
-### The subagent won't see this skill — bake the principles into the brief
+### The subagent won't have this skill loaded — bake the principles into the brief
 
-Skills are loaded into the orchestrator's context only. A spawned subagent gets its own stripped-down environment and doesn't see anything in `~/.claude/skills/`. If the subagent is doing bulk reads — which it usually is, that's why it was spawned — the relevant discipline has to travel with the brief, not be assumed.
+A subagent starts with a fresh context. The built-in agent types don't preload any skills, and although a subagent may be able to invoke one itself, nothing in a reading brief prompts it to. (A custom agent can preload skills through the `skills` field in its definition, which is worth setting up for a dedicated reader agent.) If the subagent is doing bulk reads — which it usually is, that's why it was spawned — the relevant discipline has to travel with the brief, not be assumed.
 
 Add a one-line `Discipline:` field to every brief that involves reading. A good default:
 
@@ -116,8 +122,8 @@ Briefed well — bounded, scoped, discipline baked in:
 
 ```
 Goal: I'm about to refactor SessionManager.kt and need every caller.
-Background: SessionManager lives in app/src/main/.../domain/scraping/.
-Scope: app/src/main/java/nl/ockto/mobile and its subdirs.
+Background: SessionManager lives in app/src/main/.../domain/session/.
+Scope: app/src/main/java/com/example/app and its subdirs.
 Discipline: grep first; Read with offset/limit only when grep isn't enough;
   don't quote file contents in the response.
 Report back: For each caller, file path:line and the calling line of code.
@@ -128,14 +134,16 @@ No commentary. ≤30 entries — if more, group by directory.
 
 If several independent lookups are needed, spawn them in a single message with multiple `Agent` tool calls. They run concurrently. Sequential subagent calls waste wall-clock time without saving any tokens. Independent = the result of one isn't an input to another.
 
+Subagents usually run in the background and notify you when they finish. While one is out, work on something that doesn't overlap with it — doing the same reading yourself "to get a head start" pays for it twice and puts the raw text exactly where this skill is trying to keep it out of. Don't guess at a result that hasn't arrived.
+
 ### After a subagent returns
 
 Its full report lands in context as a tool result — that *is* a cost, just a much smaller one than reading the raw files would have been. Extract what's needed and move on. There's no need to restate the findings back to the user unless they asked for them.
 
-If the summary is missing something, continue the same subagent by name (via `SendMessage`) rather than spawning a new one — that avoids re-reading the same files from scratch.
+If the summary is missing something, continue the same subagent (via `SendMessage`, by its name or ID) rather than spawning a new one — it still has the files in its context, so the follow-up costs a question instead of a re-read. Some lightweight read-only types, `Explore` among them, finish without a resumable ID; for those, send a new and narrower brief instead.
 
 ## Why this matters
 
-Prompt caching only helps when the orchestrator's context is stable. Every large file read directly pushes the cache window and risks invalidation. Keeping bulk content out of the working set keeps the conversation small, keeps the cache warm, and reserves the context budget for the judgment-heavy work that only the orchestrator can do.
+Every turn re-sends the whole conversation. Prompt caching discounts the unchanged part but doesn't make it free, so a file read directly at turn 5 is paid for again on every turn after it, and it brings the session closer to compaction — where detail is lost and the cache is rebuilt from scratch. Keeping bulk content out of the working set keeps each turn cheap and reserves the context budget for the judgment-heavy work that only the orchestrator can do.
 
 Mental model: treat the orchestrator as a senior engineer whose attention is the scarce resource. Bulk reading is grunt work — search first, read narrowly, delegate when justified, digest before passing on. The principle is the same at every level; only the available tactics change.
